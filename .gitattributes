@@ -2,7 +2,11 @@
 # Set default behavior to automatically normalize line endings.
 ###############################################################################
 * text=auto
-
+*.vsconfig text eol=lf
+*.mat text eol=lf
+*.asset text eol=lf
+*.unity text eol=lf
+*.prefab text eol=lf
 ###############################################################################
 # Set default behavior for command prompt diff.
 #
