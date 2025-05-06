@@ -42,7 +42,7 @@ public class NetworkManagerVR : MonoBehaviour
         }
 
         // Disable automatic spawning
-        networkManager.NetworkConfig.PlayerPrefab = null;
+        //networkManager.NetworkConfig.PlayerPrefab = playerPrefab.gameObject;
 
         ValidateComponents();
     }
@@ -65,6 +65,29 @@ public class NetworkManagerVR : MonoBehaviour
             enabled = false;
             return;
         }
+
+        // Add null check for NetworkConfig and Prefabs
+        if (networkManager.NetworkConfig == null || networkManager.NetworkConfig.Prefabs == null)
+        {
+            Debug.LogError("[NetworkManagerVR] NetworkConfig or Prefabs list is null!");
+            enabled = false;
+            return;
+        }
+
+        // Register the player prefab with NetworkManager
+        var prefabsList = networkManager.NetworkConfig.Prefabs.Prefabs;
+        bool prefabRegistered = prefabsList.Any(p => p.Prefab == playerPrefab.gameObject);
+
+        if (!prefabRegistered)
+        {
+            networkManager.NetworkConfig.Prefabs.Add(new NetworkPrefab { Prefab = playerPrefab.gameObject });
+            Debug.Log("[NetworkManagerVR] Player prefab registered with NetworkManager");
+        }
+
+
+        // ADD THIS LINE HERE - Before any network operations start
+        NetworkManager.Singleton.NetworkConfig.PlayerPrefab = null;
+        Debug.Log("[NetworkManagerVR] Disabled automatic player spawn");
 
         // Find or validate SpawnManager
         if (spawnManager == null)
@@ -120,13 +143,35 @@ public class NetworkManagerVR : MonoBehaviour
 
     private void OnDestroy()
     {
-        CleanupNetworking();
+        Debug.Log("[NetworkManagerVR] OnDestroy called");
+
+        // Only cleanup if we're actually in a networked state
+        if (NetworkManager.Singleton != null &&
+            (NetworkManager.Singleton.IsHost ||
+             NetworkManager.Singleton.IsServer ||
+             NetworkManager.Singleton.IsClient))
+        {
+            CleanupNetworking();
+        }
+        else
+        {
+            Debug.Log("[NetworkManagerVR] No active network connection to clean up");
+        }
     }
 
     private void CleanupNetworking()
     {
-        UnsubscribeFromEvents();
-        Disconnect();
+        Debug.Log("[NetworkManagerVR] Starting network cleanup");
+
+        try
+        {
+            UnsubscribeFromEvents();
+            Disconnect();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[NetworkManagerVR] Error during network cleanup: {e}");
+        }
     }
 
     public async Task<bool> StartHost()
@@ -149,47 +194,104 @@ public class NetworkManagerVR : MonoBehaviour
 
     public async Task<bool> StartClient()
     {
+        Debug.Log("[NetworkManagerVR] Starting client connection process...");
+
         try
         {
-            if (!ValidateNetworkState()) return false;
+            if (!ValidateNetworkState())
+            {
+                Debug.LogError("[NetworkManagerVR] Network state validation failed");
+                return false;
+            }
+
+            // Setup connection callbacks before starting
+            networkManager.OnClientConnectedCallback += (id) =>
+                Debug.Log($"[NetworkManagerVR] Client connected with ID: {id}");
+
+            networkManager.OnClientDisconnectCallback += (id) =>
+                Debug.Log($"[NetworkManagerVR] Client disconnected with ID: {id}");
 
             await Task.Yield(); // Allow frame to complete
+
+            Debug.Log("[NetworkManagerVR] Initiating client connection...");
             networkManager.StartClient();
-            Debug.Log("[NetworkManagerVR] Client started successfully");
-            return true;
+
+            // Wait briefly to check connection status
+            await Task.Delay(1000);
+
+            bool isConnected = networkManager.IsClient;
+            Debug.Log($"[NetworkManagerVR] Client connection status: {(isConnected ? "Connected" : "Failed to connect")}");
+
+            return isConnected;
         }
         catch (Exception e)
         {
-            Debug.LogError($"[NetworkManagerVR] Failed to start client: {e}");
+            Debug.LogError($"[NetworkManagerVR] Error during client start: {e}");
             return false;
         }
     }
 
     private bool ValidateNetworkState()
     {
-        if (networkManager == null || transport == null)
+        Debug.Log("[NetworkManagerVR] Starting network validation...");
+
+        // Check if components exist
+        if (networkManager == null)
         {
-            Debug.LogError("[NetworkManagerVR] Network components not initialized!");
+            Debug.LogError("[NetworkManagerVR] NetworkManager is null!");
             return false;
         }
 
-        if (networkManager.IsClient || networkManager.IsHost)
+        if (transport == null)
         {
-            Debug.LogWarning("[NetworkManagerVR] Already connected!");
+            Debug.LogError("[NetworkManagerVR] Transport is null!");
             return false;
         }
 
+        // Check connection state
+        if (networkManager.IsClient)
+        {
+            Debug.LogWarning("[NetworkManagerVR] Already connected as client!");
+            return false;
+        }
+
+        if (networkManager.IsHost)
+        {
+            Debug.LogWarning("[NetworkManagerVR] Already connected as host!");
+            return false;
+        }
+
+        Debug.Log("[NetworkManagerVR] Network validation passed");
         return true;
     }
 
     public void Disconnect()
     {
-        Debug.Log("[NetworkManagerVR] Initiating network disconnect");
-
         try
         {
-            CleanupPlayers();
-            ResetNetworkState();
+            if (NetworkManager.Singleton == null)
+            {
+                Debug.LogWarning("[NetworkManagerVR] NetworkManager.Singleton is null during disconnect");
+                return;
+            }
+
+            // Only attempt player cleanup if we're host/server
+            if (NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer)
+            {
+                CleanupPlayers();
+            }
+
+            // Store network state before shutdown
+            bool wasConnected = NetworkManager.Singleton.IsHost ||
+                              NetworkManager.Singleton.IsServer ||
+                              NetworkManager.Singleton.IsClient;
+
+            // Perform shutdown if we were connected
+            if (wasConnected)
+            {
+                NetworkManager.Singleton.Shutdown();
+                Debug.Log("[NetworkManagerVR] Network shutdown completed");
+            }
         }
         catch (Exception e)
         {
@@ -199,21 +301,73 @@ public class NetworkManagerVR : MonoBehaviour
 
     private void CleanupPlayers()
     {
-        if (!NetworkManager.Singleton.IsServer && !NetworkManager.Singleton.IsHost) return;
-
-        lock (clientLock)
+        try
         {
-            foreach (var clientId in clientSpawned.Keys.ToList())
+            // Check NetworkManager and client status
+            if (NetworkManager.Singleton == null)
             {
-                var playerObjects = GameObject.FindGameObjectsWithTag("Player")
-                    .Where(p => p != null && p.TryGetComponent<NetworkObject>(out var netObj) && netObj.OwnerClientId == clientId);
+                Debug.LogWarning("[NetworkManagerVR] NetworkManager.Singleton is null during cleanup");
+                return;
+            }
 
-                foreach (var player in playerObjects)
+            if (!NetworkManager.Singleton.IsServer && !NetworkManager.Singleton.IsHost)
+            {
+                Debug.Log("[NetworkManagerVR] Cleanup skipped - not server or host");
+                return;
+            }
+
+            // Check if our collections are initialized
+            if (clientSpawned == null)
+            {
+                Debug.LogWarning("[NetworkManagerVR] clientSpawned dictionary is null");
+                return;
+            }
+
+            if (clientLock == null)
+            {
+                Debug.LogWarning("[NetworkManagerVR] clientLock is null");
+                return;
+            }
+
+            lock (clientLock)
+            {
+                try
                 {
-                    DespawnPlayer(player, clientId);
+                    // Create a safe copy of keys to iterate
+                    var clientIds = clientSpawned.Keys.ToList();
+
+                    foreach (var clientId in clientIds)
+                    {
+                        var playerObjects = GameObject.FindGameObjectsWithTag("Player")
+                            ?.Where(p => p != null &&
+                                    p.TryGetComponent<NetworkObject>(out var netObj) &&
+                                    netObj.OwnerClientId == clientId)
+                            ?.ToList();
+
+                        if (playerObjects != null)
+                        {
+                            foreach (var player in playerObjects)
+                            {
+                                if (player != null)
+                                {
+                                    DespawnPlayer(player, clientId);
+                                }
+                            }
+                        }
+                    }
+
+                    clientSpawned.Clear();
+                    Debug.Log("[NetworkManagerVR] Players cleanup completed successfully");
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[NetworkManagerVR] Error during player cleanup in lock: {e.Message}");
                 }
             }
-            clientSpawned.Clear();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[NetworkManagerVR] Error during player cleanup: {e.Message}");
         }
     }
 
@@ -258,7 +412,7 @@ public class NetworkManagerVR : MonoBehaviour
     // In NetworkManagerVR
     private void OnServerStarted()
     {
-        Debug.Log($"Server started. IsHost: {networkManager.IsHost}");
+        Debug.Log($"[NetworkManagerVR] Server started. IsHost: {networkManager.IsHost}");
 
         if (playerPrefab == null)
         {
@@ -348,7 +502,7 @@ public class NetworkManagerVR : MonoBehaviour
                 throw new Exception("Failed to instantiate player prefab");
             }
 
-            // Spawn with ownership and automatically handle visibility
+            // This single call handles spawning, ownership, and network visibility
             playerInstance.SpawnAsPlayerObject(clientId);
 
             lock (clientLock)
